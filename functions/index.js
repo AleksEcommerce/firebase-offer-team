@@ -18,6 +18,7 @@ const apiKey = process.env.OPENAI_API_KEY;
 const storefrontEndpoint = process.env.SHOPIFY_STOREFRONT_API_ENDPOINT || '';
 const storefrontAccessToken = process.env.SHOPIFY_STOREFRONT_ACCESS_TOKEN || '';
 const mainCategoryRef = String(process.env.MAIN_CATEGORY || '').trim() || null;
+const backendVersion = String(process.env.BACKEND_VERSION || process.env.K_REVISION || '').trim() || 'dev-local';
 const MAX_HISTORY_MESSAGES = 20;
 const DEFAULT_COLLECTION_LIMIT = 12;
 const SALE_COLLECTION_FETCH_LIMIT = 50;
@@ -1192,6 +1193,39 @@ function normalizeClientState(rawState) {
           : null,
       }
     : null;
+  const servicesCatalog = safeState.services_catalog && typeof safeState.services_catalog === 'object'
+    ? {
+        services: Array.isArray(safeState.services_catalog.services)
+          ? safeState.services_catalog.services
+            .map((item) => ({
+              id: String(item?.id || '').trim() || null,
+              title: String(item?.title || '').trim() || null,
+              type: String(item?.type || 'service').trim().toLowerCase() || 'service',
+            }))
+            .filter((item) => item.id && item.title)
+          : [],
+        projects: Array.isArray(safeState.services_catalog.projects)
+          ? safeState.services_catalog.projects
+            .map((item) => ({
+              id: String(item?.id || '').trim() || null,
+              title: String(item?.title || '').trim() || null,
+              type: String(item?.type || 'project').trim().toLowerCase() || 'project',
+            }))
+            .filter((item) => item.id && item.title)
+          : [],
+      }
+    : { services: [], projects: [] };
+  const availableOptions = Array.isArray(safeState.available_options)
+    ? safeState.available_options
+      .map((item) => ({
+        index: Number.isFinite(Number(item?.index)) ? Number(item.index) : null,
+        id: String(item?.id || '').trim() || null,
+        title: String(item?.title || '').trim() || null,
+        type: String(item?.type || '').trim().toLowerCase() || null,
+      }))
+      .filter((item) => Number.isFinite(item.index) && item.title)
+    : [];
+  const pageContext = String(safeState.page_context || '').trim() || null;
 
   return {
     screen,
@@ -1202,12 +1236,56 @@ function normalizeClientState(rawState) {
     variant_options: variantOptions,
     selected_variant: selectedVariant,
     cart_state: cartState,
+    services_catalog: servicesCatalog,
+    available_options: availableOptions,
+    page_context: pageContext,
   };
+}
+
+function resolveAssistantTypeByPageContext(pageContext, fallbackType = 'storefront') {
+  const path = String(pageContext || '').trim();
+  if (path === '/') return 'services';
+  if (path === '/pages/presentation-page') return 'storefront';
+  return fallbackType;
 }
 
 function extractNumericSelection(message) {
   const value = String(message || '').trim();
   return /^\d+$/.test(value) ? Number(value) : null;
+}
+
+function extractFlexibleSelection(message, availableOptions = []) {
+  const strict = extractNumericSelection(message);
+  if (Number.isFinite(strict)) return strict;
+
+  const text = normalizeServicesIntentText(message);
+  if (!text) return null;
+
+  const directDigits = text.match(/\b(\d{1,2})\b/);
+  if (directDigits) return Number(directDigits[1]);
+
+  const map = {
+    zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10,
+    first: 1, second: 2, third: 3, fourth: 4, fifth: 5, sixth: 6, seventh: 7, eighth: 8, ninth: 9, tenth: 10,
+    ноль: 0, один: 1, два: 2, три: 3, четыре: 4, пять: 5, шесть: 6, семь: 7, восемь: 8, девять: 9, десять: 10,
+    первый: 1, второй: 2, третий: 3, четвертый: 4, пятый: 5, шестой: 6, седьмой: 7, восьмой: 8, девятый: 9, десятый: 10,
+  };
+  const tokens = text.split(' ');
+  for (const token of tokens) {
+    if (Object.prototype.hasOwnProperty.call(map, token)) return map[token];
+  }
+
+  if (Array.isArray(availableOptions) && availableOptions.length) {
+    const matchedOption = findCatalogMatchByText(
+      availableOptions.map((option) => ({ ...option, title: option.title })),
+      message,
+    );
+    if (matchedOption && Number.isFinite(Number(matchedOption.index))) {
+      return Number(matchedOption.index);
+    }
+  }
+
+  return null;
 }
 
 function createTraceContext({ message, history, clientState, language }) {
@@ -1267,7 +1345,27 @@ function renderServicesEntryResponse(language = 'en') {
 }
 
 function normalizeServicesIntentText(value) {
-  return String(value || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9а-яёіїєґ\s]/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function findCatalogMatchByText(items = [], message = '') {
+  const normalizedMessage = normalizeServicesIntentText(message);
+  if (!normalizedMessage || !Array.isArray(items) || !items.length) return null;
+
+  const exact = items.find((item) => normalizeServicesIntentText(item?.title) === normalizedMessage);
+  if (exact) return exact;
+
+  const contains = items.find((item) => {
+    const normalizedTitle = normalizeServicesIntentText(item?.title);
+    return normalizedTitle && (normalizedMessage.includes(normalizedTitle) || normalizedTitle.includes(normalizedMessage));
+  });
+  if (contains) return contains;
+
+  return null;
 }
 
 function detectServicesIntent(message) {
@@ -1332,9 +1430,59 @@ function renderServicesScreenResponse(screen, language = 'en') {
 }
 
 function handleServicesDeterministicInput({ message, language, clientState }) {
-  const selection = extractNumericSelection(message);
+  const selection = extractFlexibleSelection(message, clientState?.available_options);
   const currentScreen = normalizeScreen(clientState?.screen) || SCREEN_SERVICES_ENTRY;
   const semanticIntent = detectServicesIntent(message);
+  const servicesItems = Array.isArray(clientState?.services_catalog?.services) ? clientState.services_catalog.services : [];
+  const projectsItems = Array.isArray(clientState?.services_catalog?.projects) ? clientState.services_catalog.projects : [];
+
+  if (!selection) {
+    const servicesItemMatch = findCatalogMatchByText(servicesItems, message);
+    if (servicesItemMatch) {
+      const responseText = language === 'ru'
+        ? `<p>Открываю сервис <strong>${servicesItemMatch.title}</strong>.</p>`
+        : `<p>Opening service <strong>${servicesItemMatch.title}</strong>.</p>`;
+      return {
+        screen: 'SERVICES_SERVICE_FOCUS',
+        text: responseText,
+        decision: { tool: null, parameters: null, response: responseText },
+        actions: [],
+        tool_results: [],
+        screen_state: {
+          screen: 'SERVICES_SERVICE_FOCUS',
+          focused_item: {
+            id: servicesItemMatch.id,
+            type: servicesItemMatch.type || 'service',
+            title: servicesItemMatch.title,
+          },
+        },
+        debug: { route: 'services_catalog_match', assistant_type: 'services', matched_group: 'services' },
+      };
+    }
+
+    const projectsItemMatch = findCatalogMatchByText(projectsItems, message);
+    if (projectsItemMatch) {
+      const responseText = language === 'ru'
+        ? `<p>Открываю проект <strong>${projectsItemMatch.title}</strong>.</p>`
+        : `<p>Opening project <strong>${projectsItemMatch.title}</strong>.</p>`;
+      return {
+        screen: 'SERVICES_PROJECT_FOCUS',
+        text: responseText,
+        decision: { tool: null, parameters: null, response: responseText },
+        actions: [],
+        tool_results: [],
+        screen_state: {
+          screen: 'SERVICES_PROJECT_FOCUS',
+          focused_item: {
+            id: projectsItemMatch.id,
+            type: projectsItemMatch.type || 'project',
+            title: projectsItemMatch.title,
+          },
+        },
+        debug: { route: 'services_catalog_match', assistant_type: 'services', matched_group: 'projects' },
+      };
+    }
+  }
 
   if (!selection && semanticIntent) {
     const intentScreenMap = {
@@ -1364,13 +1512,25 @@ function handleServicesDeterministicInput({ message, language, clientState }) {
 
   const servicesMap = {
     1: SCREEN_SERVICES_SERVICES,
-    2: SCREEN_SERVICES_PRICES,
-    3: SCREEN_SERVICES_PROJECTS,
-    4: SCREEN_SERVICES_ABOUT,
-    5: SCREEN_SERVICES_CONTACTS,
+    2: SCREEN_SERVICES_PROJECTS,
+    3: SCREEN_SERVICES_ABOUT,
+    4: SCREEN_SERVICES_CONTACTS,
   };
   const nextScreen = servicesMap[selection];
-  if (!nextScreen) return null;
+  if (!nextScreen) {
+    const invalidSelectionResponse = language === 'ru'
+      ? '<p>Извините, у нас нет такого пункта. Выберите вариант 1–4 или задайте ваш вопрос в чате.</p>'
+      : '<p>Sorry, this option is not available. Please choose 1–4 or ask your question in chat.</p>';
+    return {
+      screen: SCREEN_SERVICES_ENTRY,
+      text: invalidSelectionResponse,
+      decision: { tool: null, parameters: null, response: invalidSelectionResponse },
+      actions: [],
+      tool_results: [],
+      screen_state: { screen: SCREEN_SERVICES_ENTRY },
+      debug: { route: 'services_invalid_selection', assistant_type: 'services', selection },
+    };
+  }
 
   return {
     screen: nextScreen, text: renderServicesScreenResponse(nextScreen, language),
@@ -1672,7 +1832,7 @@ function resolveResponseScreen({ decision, toolResult }) {
 
 function createSuccessPayload({ modelName, screen, text = '', responseId = null, historyCount = 0, decision = null, actions = [], toolResults, screenState = null, debug = {}, trace = null }) {
   const normalizedText = LOCAL_RENDERED_SCREENS.has(screen) ? '' : text;
-  const payload = { ok: true, model: modelName, screen, screen_state: screenState, debug: buildDebugPayload(screen, { ...debug, ...buildTraceDebug(trace) }), text: normalizedText, response_id: responseId, history_count: historyCount, decision, actions };
+  const payload = { ok: true, model: modelName, screen, screen_state: screenState, debug: buildDebugPayload(screen, { ...debug, backend_version: backendVersion, ...buildTraceDebug(trace) }), text: normalizedText, response_id: responseId, history_count: historyCount, decision, actions };
   if (toolResults) payload.tool_results = toolResults;
   return payload;
 }
@@ -1799,11 +1959,12 @@ app.post('/ai', async (req, res) => {
     const clientState = normalizeClientState(body?.client_state);
 
     const agentRequestContext = buildAgentRequestContext({ payload: body, registry: agentRegistry, language, history, clientState });
-    const assistantType = agentRequestContext.assistantType;
+    const requestedAssistantType = agentRequestContext.assistantType;
+    const assistantType = resolveAssistantTypeByPageContext(clientState?.page_context, requestedAssistantType);
     const trace = createTraceContext({ message, history, clientState, language });
 
-    pushTraceStep(trace, 'request_received', { model, assistant_type: assistantType, session_key: agentRequestContext.sessionKey });
-    console.log('[AI Local Trace]', JSON.stringify({ trace_id: trace.trace_id, step: 'request_received', message, language, client_state: clientState, assistant_type: assistantType, session_key: agentRequestContext.sessionKey }));
+    pushTraceStep(trace, 'request_received', { model, assistant_type: assistantType, requested_assistant_type: requestedAssistantType, page_context: clientState?.page_context || null, session_key: agentRequestContext.sessionKey });
+    console.log('[AI Local Trace]', JSON.stringify({ trace_id: trace.trace_id, step: 'request_received', message, language, client_state: clientState, assistant_type: assistantType, requested_assistant_type: requestedAssistantType, page_context: clientState?.page_context || null, session_key: agentRequestContext.sessionKey }));
 
     if (!message) {
       return res.status(400).json({ error: 'Field "message" is required' });
